@@ -1,0 +1,199 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+.visible .entry softmax_fwd_kernel(
+	.param .u64 probs_param,
+	.param .u64 logits_param,
+	.param .u32 B_param,
+	.param .u32 T_param,
+	.param .u32 V_param,
+	.param .u32 Vp_param
+)
+{
+  // Register Declarations
+  .reg .pred %guard;
+  .reg .b32 %B, %T, %V, %Vp, %bt, %N, %threadid, %threads, %bt_Vp, %idx,
+            %lane, %warp_id, %offset, %r_shuffled_bits;
+  .reg .f32 %local_max, %logits_val, %local_sum, %inv_sum;
+  .reg .b64 %probs_ptr, %logits_ptr, %logits_bt, %probs_bt, %logits_bt_i,
+            %shared_max_ptr, %shared_sum_ptr, %probs_bt_i;
+
+  .shared .align 4 .f32 shared_max[32];
+  .shared .align 4 .f32 shared_sum[32];
+
+  // Load params
+  ld.param.u64 %probs_ptr, [probs_param];
+  ld.param.u64 %logits_ptr, [logits_param];
+  ld.param.u32 %B, [B_param];
+  ld.param.u32 %T, [T_param];
+  ld.param.u32 %V, [V_param];
+  ld.param.u32 %Vp, [Vp_param];
+
+  // Guard 
+  mov.u32 %bt, %ctaid.x;  
+  mul.lo.u32 %N, %B, %T;
+  setp.ge.s32 %guard, %bt, %N;
+  @%guard bra $exit;
+
+  // Index calculation
+  cvta.to.global.u64 %logits_ptr, %logits_ptr;
+  cvta.to.global.u64 %probs_ptr, %probs_ptr;
+  mul.lo.u32 %bt_Vp, %bt, %Vp;
+  mad.wide.u32 %logits_bt, %bt_Vp, 4, %logits_ptr;
+  mad.wide.u32 %probs_bt, %bt_Vp, 4, %probs_ptr;
+  mov.u32 %threadid, %tid.x;
+  mov.u32 %threads, %ntid.x;
+
+  // Find max over real vocab [0, V)
+  mov.f32 %local_max, 0FFF800000; // -inf
+  mov.u32 %idx, %threadid;
+
+  $find_max_loop:
+  mad.wide.u32 %logits_bt_i, %idx, 4, %logits_bt;
+  ld.global.f32 %logits_val, [%logits_bt_i];
+  max.f32 %local_max, %local_max, %logits_val;
+  add.u32 %idx, %idx, %threads;
+  setp.lt.u32 %guard, %idx, %V;
+  @%guard bra $find_max_loop;
+
+  // Block-wide reduction to find the max
+  rem.u32 %lane, %threadid, 32;
+  div.u32 %warp_id, %threadid, 32;
+  // warp reduction -> each warp finds its max
+  mov.u32 %offset, 16;
+  $warp_reduce_max:
+  shfl.sync.down.b32 %r_shuffled_bits, %local_max, %offset, 0x1f, 0xffffffff;
+  max.f32 %local_max, %local_max, %r_shuffled_bits;
+  shr.u32 %offset, %offset, 1; // halve the offset
+  setp.gt.u32 %guard, %offset, 0;
+  @%guard bra $warp_reduce_max;
+
+  // Store the max in shared memory
+  // if (lane == 0) shared[warp_id] = local_max;
+  setp.eq.u32 %guard, %lane, 0;
+  mov.u64 %shared_max_ptr, shared_max;
+  mad.wide.u32 %shared_max_ptr, %warp_id, 4, %shared_max_ptr;
+  @%guard st.shared.f32 [%shared_max_ptr], %local_max;
+  // __syncthreads();
+  bar.sync 0;
+
+  // val = (wid == 0) ? shared[lane] : -CUDART_INF_F;
+  setp.eq.u32 %guard, %warp_id, 0;
+  mov.f32 %local_max, 0FFF800000; // -inf
+  mov.u64 %shared_max_ptr, shared_max;
+  mad.wide.u32 %shared_max_ptr, %lane, 4, %shared_max_ptr;
+  @%guard ld.shared.f32 %local_max, [%shared_max_ptr];
+  
+  // 2nd pass, warp-wide reduction
+  mov.u32 %offset, 16;
+  $warp_reduce_max2:
+  shfl.sync.down.b32 %r_shuffled_bits, %local_max, %offset, 0x1f, 0xffffffff;
+  max.f32 %local_max, %local_max, %r_shuffled_bits;
+  shr.u32 %offset, %offset, 1; // halve the offset
+  setp.gt.u32 %guard, %offset, 0;
+  @%guard bra $warp_reduce_max2;
+
+  // if (threadIdx.x == 0) shared[0] = local_max;
+  setp.eq.u32 %guard, %threadid, 0;
+  mov.u64 %shared_max_ptr, shared_max;
+  @%guard st.shared.f32 [%shared_max_ptr], %local_max;
+
+  // __syncthreads();
+  bar.sync 0;
+  // set local_max to shared[0]
+  ld.shared.f32 %local_max, [shared_max];
+  bar.sync 0;
+
+  // 2) computet exp(logit - maxval) and partial sum
+  mov.f32 %local_sum, 0F00000000; // 0.0
+  mov.u32 %idx, %threadid;
+  $compute_exp_loop:
+  mad.wide.u32 %logits_bt_i, %idx, 4, %logits_bt;
+  ld.global.f32 %logits_val, [%logits_bt_i];
+  sub.f32 %logits_val, %logits_val, %local_max;
+  mul.f32 %logits_val, %logits_val, 0f3fb8aa3b; 
+  ex2.approx.ftz.f32 %logits_val, %logits_val; // using exp2 for better precision
+  add.f32 %local_sum, %local_sum, %logits_val;
+  mad.wide.u32 %probs_bt_i, %idx, 4, %probs_bt;
+  st.global.f32 [%probs_bt_i], %logits_val;
+  add.u32 %idx, %idx, %threads;
+  setp.lt.u32 %guard, %idx, %V;
+  @%guard bra $compute_exp_loop;
+
+  // Block-wide reduction to find the sum
+  // warp reduction -> each warp finds its sum
+  mov.u32 %offset, 16;
+  $warp_reduce_sum:
+  shfl.sync.down.b32 %r_shuffled_bits, %local_sum, %offset, 0x1f, 0xffffffff;
+  add.f32 %local_sum, %local_sum, %r_shuffled_bits;
+  shr.u32 %offset, %offset, 1; // halve the offset
+  setp.gt.u32 %guard, %offset, 0;
+  @%guard bra $warp_reduce_sum;
+
+  // Store the max in shared memory
+  // if (lane == 0) shared[warp_id] = local_max;
+  setp.eq.u32 %guard, %lane, 0;
+  mov.u64 %shared_sum_ptr, shared_sum;
+  mad.wide.u32 %shared_sum_ptr, %warp_id, 4, %shared_sum_ptr;
+  @%guard st.shared.f32 [%shared_sum_ptr], %local_sum;
+  // __syncthreads();
+  bar.sync 0;
+
+  // val = (wid == 0) ? shared[lane] : 0.0f;
+  setp.eq.u32 %guard, %warp_id, 0;
+  mov.f32 %local_sum, 0F00000000; // 0.0
+  mov.u64 %shared_sum_ptr, shared_sum;
+  mad.wide.u32 %shared_sum_ptr, %lane, 4, %shared_sum_ptr;
+  @%guard ld.shared.f32 %local_sum, [%shared_sum_ptr];
+  
+  // 2nd pass, warp-wide reduction
+  mov.u32 %offset, 16;
+  $warp_reduce_sum2:
+  shfl.sync.down.b32 %r_shuffled_bits, %local_sum, %offset, 0x1f, 0xffffffff;
+  add.f32 %local_sum, %local_sum, %r_shuffled_bits;
+  shr.u32 %offset, %offset, 1; // halve the offset
+  setp.gt.u32 %guard, %offset, 0;
+  @%guard bra $warp_reduce_sum2;
+
+  // if (threadIdx.x == 0) shared[0] = local_sum;
+  setp.eq.u32 %guard, %threadid, 0;
+  mov.u64 %shared_sum_ptr, shared_sum;
+  @%guard st.shared.f32 [%shared_sum_ptr], %local_sum;
+
+  // __syncthreads();
+  bar.sync 0;
+  ld.shared.f32 %local_sum, [shared_sum]; 
+  bar.sync 0;
+
+  // float inv_sum = (sum > 0.0f ? 1.0f / sum : 0.0f);
+  setp.gt.f32 %guard, %local_sum, 0F00000000; // 0.0
+  mov.f32 %inv_sum, 0F00000000; // 0.0
+  @%guard rcp.approx.f32 %inv_sum, %local_sum;
+
+  // 3) normalize the real-vocab probs
+  mov.u32 %idx, %threadid;
+  $normalize_loop:
+  mad.wide.u32 %probs_bt_i, %idx, 4, %probs_bt;
+  ld.global.f32 %logits_val, [%probs_bt_i];
+  mul.f32 %logits_val, %logits_val, %inv_sum;
+  st.global.f32 [%probs_bt_i], %logits_val;
+  add.u32 %idx, %idx, %threads;
+  setp.lt.u32 %guard, %idx, %V;
+  @%guard bra $normalize_loop;
+
+  // 4) zero out the padding probs
+  add.u32 %idx, %V, %threadid;
+  bra $zero_padding_check; 
+  $zero_padding_loop:
+   mad.wide.u32 %probs_bt_i, %idx, 4, %probs_bt;
+   st.global.f32 [%probs_bt_i], 0F00000000; // 0.0
+   add.u32 %idx, %idx, %threads;
+  $zero_padding_check:
+   setp.lt.u32 %guard, %idx, %Vp;
+   @%guard bra $zero_padding_loop;
+
+  $exit:
+    ret;
+}
+

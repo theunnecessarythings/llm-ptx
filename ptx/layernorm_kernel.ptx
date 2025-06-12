@@ -1,0 +1,154 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+
+.visible .entry layernorm_fwd_kernel(
+  .param .u64 out_param,
+  .param .u64 inp_param,
+  .param .u64 weight_param,
+  .param .u64 bias_param,
+  .param .s32 N_param,
+  .param .s32 C_param
+)
+{
+    .shared .align 4 .b8 %shared_sum_arr[128];   
+    .shared .align 4 .b8 %shared_sum2_arr[128];  
+    // Register Declarations
+    .reg .pred %cond;
+    .reg .f32 %thread_sum, %thread_sum2, %warp_sum, %warp_sum2,
+            %block_sumf32, %block_sum2f32, %xi, %n, %m, %m2, %var, %s, %weight_val, 
+            %bias_val, %shuffled_bits_f32, %Cf32;
+    .reg .b32 %i, %idx, %warp_id, %lane_id, %offset, %N, %num_warps, %C4,
+            %shuffled_bits, %C, %ntidx, %tidx, %block_sum, %block_sum2, %shared_sum,
+            %shared_sum2, %shared_sum_ptr, %shared_sum2_ptr;
+    .reg .b64 %out_ptr, %inp_ptr, %weight_ptr, %bias_ptr, %xi_ptr, 
+            %out_ptr_i, %weight_ptr_i, %bias_ptr_i, %x_ptr;
+
+
+    // Load params
+    ld.param.u64 %out_ptr, [out_param];
+    ld.param.u64 %inp_ptr, [inp_param];
+    ld.param.u64 %weight_ptr, [weight_param];
+    ld.param.u64 %bias_ptr, [bias_param];
+    ld.param.s32 %N, [N_param];
+    ld.param.s32 %C, [C_param];
+    cvta.to.global.u64 %out_ptr, %out_ptr;
+    cvta.to.global.u64 %inp_ptr, %inp_ptr;
+    cvta.to.global.u64 %weight_ptr, %weight_ptr;
+    cvta.to.global.u64 %bias_ptr, %bias_ptr;
+
+    mov.s32 %shared_sum, %shared_sum_arr;
+    mov.s32 %shared_sum2, %shared_sum2_arr;
+    mov.s32 %ntidx, %ntid.x;
+    mov.s32 %tidx, %tid.x;
+    shr.b32 %num_warps, %ntidx, 5;
+    shr.b32 %warp_id, %tidx, 5;
+    rem.s32 %lane_id, %tidx, 32;
+    mov.s32 %idx, %ctaid.x;
+    shl.b32 %C4, %C, 2;
+    mad.wide.s32 %x_ptr, %idx, %C4, %inp_ptr;
+
+
+    // Guard
+    setp.ge.s32 %cond, %idx, %N;
+    @%cond ret;
+
+    // Thread-local summation
+    mov.f32 %thread_sum, 0f00000000;
+    mov.f32 %thread_sum2, 0f00000000;
+
+    mov.s32 %i, %tid.x;
+    bra $thread_local_cond;
+    $thread_local_loop:
+        mad.wide.s32 %xi_ptr, %i, 4, %x_ptr;
+        ld.global.f32 %xi, [%xi_ptr];
+        add.f32 %thread_sum, %thread_sum, %xi;
+        fma.rn.f32 %thread_sum2, %xi, %xi, %thread_sum2;
+        add.s32 %i, %i, %ntidx;
+    $thread_local_cond:
+        setp.lt.s32 %cond, %i, %C;
+        @%cond bra $thread_local_loop;
+
+    // Warp-level reduction
+    mov.s32 %offset, 16;
+    bra $warp_reduce_cond;
+    $warp_reduce_loop:
+       shfl.sync.down.b32 %shuffled_bits_f32, %thread_sum, %offset, 0x1f, 0xffffffff;
+       add.f32 %thread_sum, %thread_sum, %shuffled_bits_f32;
+       shfl.sync.down.b32 %shuffled_bits_f32, %thread_sum2, %offset, 0x1f, 0xffffffff;
+       add.f32 %thread_sum2, %thread_sum2, %shuffled_bits_f32;
+       shr.s32 %offset, %offset, 1;
+    $warp_reduce_cond:
+        setp.gt.s32 %cond, %offset, 0;
+        @%cond bra $warp_reduce_loop;
+
+    // lane 0 - write partial sum to shared memory
+    setp.eq.s32 %cond, %lane_id, 0;
+    @!%cond bra $after_shared_write;
+    mad.lo.s32 %shared_sum_ptr, %warp_id, 4, %shared_sum;
+    mad.lo.s32 %shared_sum2_ptr, %warp_id, 4, %shared_sum2;
+    st.shared.f32 [%shared_sum_ptr], %thread_sum;
+    st.shared.f32 [%shared_sum2_ptr], %thread_sum2;
+
+    $after_shared_write:
+    bar.sync 0;
+
+    // Each warp reads its partial sum
+    mov.f32 %warp_sum, 0f00000000;
+    mov.f32 %warp_sum2, 0f00000000;
+    setp.lt.s32 %cond, %lane_id, %num_warps;
+    @!%cond bra $after_warp_read; 
+    mad.lo.s32 %shared_sum_ptr, %lane_id, 4, %shared_sum;
+    mad.lo.s32 %shared_sum2_ptr, %lane_id, 4, %shared_sum2;
+    ld.shared.f32 %warp_sum, [%shared_sum_ptr];
+    ld.shared.f32 %warp_sum2, [%shared_sum2_ptr];
+
+    $after_warp_read:
+    // 2nd warp-level reduction
+    mov.s32 %offset, 16;
+    bra $warp_reduce_cond2;
+    $warp_reduce_loop2:
+       shfl.sync.down.b32 %shuffled_bits_f32, %warp_sum, %offset, 0x1f, 0xffffffff;
+       add.f32 %warp_sum, %warp_sum, %shuffled_bits_f32;
+       shfl.sync.down.b32 %shuffled_bits_f32, %warp_sum2, %offset, 0x1f, 0xffffffff;
+       add.f32 %warp_sum2, %warp_sum2, %shuffled_bits_f32;
+       shr.s32 %offset, %offset, 1;
+    $warp_reduce_cond2:
+        setp.gt.s32 %cond, %offset, 0;
+        @%cond bra $warp_reduce_loop2;
+
+    // Broadcast the final sum to all threads
+    shfl.sync.idx.b32 %block_sumf32, %warp_sum, 0, 0x1f, 0xffffffff;
+    shfl.sync.idx.b32 %block_sum2f32, %warp_sum2, 0, 0x1f, 0xffffffff;
+
+    cvt.rn.f32.s32 %Cf32, %C;
+    div.rn.f32 %m, %block_sumf32, %Cf32;
+    div.rn.f32 %block_sum2f32, %block_sum2f32, %Cf32;
+    mul.f32 %m2, %m, %m;
+    sub.f32 %var, %block_sum2f32, %m2;
+    add.f32 %var, %var, 0f3727C5AC;
+    rsqrt.approx.f32 %s, %var;
+
+    // Normalize 
+    mad.wide.s32 %out_ptr, %idx, %C4, %out_ptr;
+    mov.s32 %i, %tid.x;
+    bra $normalize_cond;
+    $normalize_loop:
+        mad.wide.s32 %xi_ptr, %i, 4, %x_ptr;
+        ld.global.cs.f32 %xi, [%xi_ptr];
+        sub.f32 %n, %xi, %m;
+        mul.f32 %n, %n, %s;
+        mad.wide.s32 %weight_ptr_i, %i, 4, %weight_ptr;
+        ld.global.nc.f32 %weight_val, [%weight_ptr_i];
+        mad.wide.s32 %bias_ptr_i, %i, 4, %bias_ptr;
+        ld.global.nc.f32 %bias_val, [%bias_ptr_i];
+        fma.rn.f32 %n, %n, %weight_val, %bias_val;
+        mad.wide.s32 %out_ptr_i, %i, 4, %out_ptr;
+        st.global.cs.f32 [%out_ptr_i], %n;
+        add.s32 %i, %i, %ntidx;
+    $normalize_cond:
+        setp.lt.s32 %cond, %i, %C;
+        @%cond bra $normalize_loop;
+    ret;
+}

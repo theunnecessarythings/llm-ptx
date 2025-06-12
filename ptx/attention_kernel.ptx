@@ -1,0 +1,200 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+.visible .entry attention_fwd_kernel(
+    .param .u64 out_param,
+    .param .u64 preattn_param,
+    .param .u64 attn_param,
+    .param .u64 inp_param,
+    .param .u32 B_param,
+    .param .u32 T_param,
+    .param .u32 C_param,
+    .param .u32 NH_param
+)
+{
+  // Register Declarations
+  .reg .pred %cond;
+  .reg .b32 %B, %T, %bT, %TT, %tC, %C, %NH, %h, %b, %t, %hs, %hhsC, %C3, %C2,
+            %hs_x4, %C3_x4, %t2, %i, %bth_offset, %b_NH_h, %b_NH_TT, %bth_t2_offset, 
+            %offset, %value_t2_offset;
+  .reg .b64 %att_bth_ptr, %preatt_bth_ptr, %out_bth_ptr,
+            %out_ptr, %preattn_ptr, %attn_ptr, %inp_ptr, %inp_b_ptr,
+            %query_t_ptr, %key_t2_ptr, %query_ti_ptr,
+            %key_t2i_ptr, %preatt_bthi_ptr, %att_bthi_ptr,
+            %out_bthi_ptr, %value_t2i_ptr, %value_t2_ptr, %C_x4;
+  .reg .f32 %q_val, %k_val, %expsum_inv_f32, %hs_f32,
+            %scale_f32, %hs_sqrt_f32, %preatt_val_f32, %att_val_f32,
+            %expv_f32, %val_f32, %out_val_f32, %hs_sqrt, %scalee, %expsum_inv,
+            %expsum, %maxval, %value, %value_f32, %out_val, %att_val, %preatt_val,
+            %expv, %val, %scale;
+
+  // Load parameters
+  ld.param.u64 %out_ptr, [out_param];
+  ld.param.u64 %preattn_ptr, [preattn_param];
+  ld.param.u64 %attn_ptr, [attn_param];
+  ld.param.u64 %inp_ptr, [inp_param];
+  ld.param.u32 %B, [B_param];
+  ld.param.u32 %T, [T_param];
+  ld.param.u32 %C, [C_param];
+  ld.param.u32 %NH, [NH_param];
+  cvta.to.global.u64 %out_ptr, %out_ptr;
+  cvta.to.global.u64 %preattn_ptr, %preattn_ptr;
+  cvta.to.global.u64 %attn_ptr, %attn_ptr;
+  cvta.to.global.u64 %inp_ptr, %inp_ptr;
+
+  // Index and Guarding
+  mov.u32 %h, %ctaid.x;
+  mov.u32 %b, %ctaid.y;
+  mov.u32 %t, %tid.x;
+  
+  // Guarding is automatically handled by the grid size and block size
+  setp.ge.u32  %cond, %t,  %T;
+  @%cond bra   $exit;
+  setp.ge.u32  %cond, %h,  %NH;
+  @%cond bra   $exit;
+  setp.ge.u32  %cond, %b,  %B;
+  @%cond bra   $exit;
+
+  // calculate scale
+  mul.lo.u32 %C3, %C, 3;
+  div.u32 %hs, %C, %NH;
+  cvt.rn.f32.u32 %hs_f32, %hs;
+  sqrt.rn.f32 %hs_sqrt, %hs_f32;
+  rcp.rn.f32 %scale, %hs_sqrt;
+
+  // load pointers
+  mul.lo.u32 %C3_x4, %C3, 4;
+  mul.lo.u32 %hs_x4, %hs, 4;
+  mul.lo.u32 %bT, %b, %T;
+  mad.wide.u32 %inp_b_ptr, %bT, %C3_x4, %inp_ptr;
+  mad.wide.u32 %query_t_ptr, %t, %C3_x4, %inp_b_ptr;
+  mad.wide.u32 %query_t_ptr, %h, %hs_x4, %query_t_ptr;
+  mad.lo.u32 %b_NH_h, %b, %NH, %h;
+  mul.lo.u32 %TT, %T, %T;
+  mul.lo.u32 %b_NH_TT, %b_NH_h, %TT;
+  mad.lo.u32 %bth_offset, %t, %T, %b_NH_TT;
+  mad.wide.u32 %preatt_bth_ptr, %bth_offset, 4, %preattn_ptr;
+  mad.wide.u32 %att_bth_ptr, %bth_offset, 4, %attn_ptr;
+
+  // Pass 1: Calculate Q.K^T and find maxval (causal attention) 
+  // Each thread finds its own maxval, no block reduction needed
+  mov.f32 %maxval, 0fc61c4000; // -10000.0f
+  mov.u32 %t2, 0;
+  $pass1_loop:
+    mad.lo.u32 %hhsC, %h, %hs, %C;
+    mad.lo.u32 %offset, %t2, %C3, %hhsC;
+    mad.wide.u32 %key_t2_ptr, %offset, 4, %inp_b_ptr;
+
+    // Dot product
+    mov.f32 %val, 0f00000000; // 0.0f
+    mov.u32 %i, 0;
+    $dot_product_loop:
+      mad.wide.u32 %query_ti_ptr, %i, 4, %query_t_ptr;
+      mad.wide.u32 %key_t2i_ptr, %i, 4, %key_t2_ptr;
+      ld.global.f32 %q_val, [%query_ti_ptr];
+      ld.global.f32 %k_val, [%key_t2i_ptr];
+      fma.rn.f32 %val, %q_val, %k_val, %val;
+      add.u32 %i, %i, 1;
+      setp.lt.u32 %cond, %i, %hs;
+      @%cond bra $dot_product_loop;
+
+    mul.f32 %val, %val, %scale;
+    setp.gt.f32 %cond, %val, %maxval;
+    @%cond mov.f32 %maxval, %val;
+    mad.wide.u32 %preatt_bthi_ptr, %t2, 4, %preatt_bth_ptr;
+    st.global.f32 [%preatt_bthi_ptr], %val;
+    add.u32 %t2, %t2, 1;
+    setp.le.u32 %cond, %t2, %t;
+    @%cond bra $pass1_loop;
+
+  // Pass 2: Calculate exponentials and sum for the softmax denominator
+  // Each thread calculates its own sum, no block reduction.
+  mov.f32 %expsum, 0f00000000; // 0.0f
+  mov.u32 %t2, 0;
+  $pass2_loop:
+    mad.wide.u32 %preatt_bthi_ptr, %t2, 4, %preatt_bth_ptr;
+    ld.global.f32 %preatt_val, [%preatt_bthi_ptr];
+    sub.f32 %preatt_val, %preatt_val, %maxval; 
+    mul.f32 %preatt_val, %preatt_val, 0f3fb8aa3b;
+    ex2.approx.ftz.f32 %expv, %preatt_val; 
+    add.f32 %expsum, %expsum, %expv;
+    mad.wide.u32 %att_bthi_ptr, %t2, 4, %att_bth_ptr;
+    st.global.f32 [%att_bthi_ptr], %expv;
+    add.u32 %t2, %t2, 1;
+    setp.le.u32 %cond, %t2, %t;
+    @%cond bra $pass2_loop;
+
+  // calculatte expsum_inv
+  mov.f32 %expsum_inv, 0f00000000; // 0.0f
+  setp.eq.f32 %cond, %expsum, 0f00000000; // avoid division by zero
+  @!%cond rcp.rn.f32 %expsum_inv, %expsum;
+
+  // Pass 3: Normalize to get final softmax scores
+  mov.u32 %t2, 0;
+  $pass3_loop:
+    mad.wide.u32 %att_bthi_ptr, %t2, 4, %att_bth_ptr;
+    ld.global.f32 %att_val, [%att_bthi_ptr];
+    mul.f32 %att_val, %att_val, %expsum_inv;
+    st.global.f32 [%att_bthi_ptr], %att_val; 
+    add.u32 %t2, %t2, 1;
+    setp.le.u32 %cond, %t2, %t;
+    @%cond bra $pass3_loop;
+
+    // Explicitly zero out future tokens
+    add.u32 %t2, %t, 1;
+      bra $zero_out_check;
+    $zero_out_loop:
+      mad.wide.u32 %att_bthi_ptr, %t2, 4, %att_bth_ptr;
+      st.global.f32 [%att_bthi_ptr], 0f00000000; // 0.0f
+      add.u32 %t2, %t2, 1;
+    $zero_out_check:
+      setp.lt.u32 %cond, %t2, %T;
+      @%cond bra $zero_out_loop;
+
+  // Pass 4: Accumulate weighted values into the output
+  mul.lo.u32 %tC, %t, %C;
+  mad.lo.u32 %bth_offset, %bT, %C, %tC;
+  mad.lo.u32 %bth_offset, %h, %hs, %bth_offset;
+  mad.wide.u32 %out_bth_ptr, %bth_offset, 4, %out_ptr;
+
+  // Initialize the output vector to zeros
+  mov.u32 %i, 0;
+  $init_zero_loop:
+    mad.wide.u32 %out_bthi_ptr, %i, 4, %out_bth_ptr;
+    st.global.f32 [%out_bthi_ptr], 0f00000000; // 0.0f
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %cond, %i, %hs;
+    @%cond bra $init_zero_loop;
+
+  mov.u32 %t2, 0;
+  shl.b32 %C2, %C, 1;
+  mad.lo.u32 %offset, %h, %hs, %C2;
+
+  $accumulate_loop:
+    mad.lo.u32 %value_t2_offset, %t2, %C3, %offset;
+    mad.wide.u32 %value_t2_ptr, %value_t2_offset, 4, %inp_b_ptr;
+    mad.wide.u32 %att_bthi_ptr, %t2, 4, %att_bth_ptr;
+    ld.global.f32 %att_val_f32, [%att_bthi_ptr];
+    mov.u32 %i, 0;
+  $accumulate_inner_loop:
+    mad.wide.u32 %value_t2i_ptr, %i, 4, %value_t2_ptr;
+    mad.wide.u32 %out_bthi_ptr, %i, 4, %out_bth_ptr;
+    ld.global.f32 %value_f32, [%value_t2i_ptr];
+    ld.global.f32 %out_val_f32, [%out_bthi_ptr];
+    fma.rn.f32 %out_val_f32, %att_val_f32, %value_f32, %out_val_f32;
+    st.global.f32 [%out_bthi_ptr], %out_val_f32;
+
+    // Inner loop increment and branch
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %cond, %i, %hs;
+    @%cond bra $accumulate_inner_loop;
+
+  // Outer loop increment and branch
+  add.u32 %t2, %t2, 1;
+  setp.le.u32 %cond, %t2, %t;
+  @%cond bra $accumulate_loop;
+
+  $exit:
+  ret;
+}

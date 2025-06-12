@@ -1,0 +1,57 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+
+.visible .entry gelu_fwd_kernel(
+  .param .u64 out_param,
+  .param .u64 inp_param,
+  .param .u32 N_param
+) 
+{
+  // Register Declarations
+  .reg .pred  %guard;
+  .reg .b32 %N, %tid_x, %blockid_x, %blockdim_x, %idx;
+  .reg .f32 %inp_i, %out_i, %const, %scaling_factor, %cube;
+  .reg .f32 %tmp<9>;
+  .reg .b64 %out_addr, %inp_addr, %out_glbl, %inp_glbl, %offset;
+  .reg .b64 %inp_i_addr, %out_i_addr;
+
+    
+  // Load params
+  ld.param.u64 %out_addr, [out_param];
+  ld.param.u64 %inp_addr, [inp_param];
+  ld.param.u32 %N, [N_param];
+
+  // Index and Guard calculation
+  mov.u32 %blockid_x, %ctaid.x;
+  mov.u32 %blockdim_x, %ntid.x;
+  mov.u32 %tid_x, %tid.x;
+  mad.lo.s32 %idx, %blockid_x, %blockdim_x, %tid_x;
+  setp.ge.s32 %guard, %idx, %N;
+  @%guard bra $exit;
+
+  // Calculate
+  cvta.to.global.u64 %inp_glbl, %inp_addr;
+  cvta.to.global.u64 %out_glbl, %out_addr;
+  mul.wide.s32 %offset, %idx, 4;
+  add.s64 %inp_i_addr, %inp_glbl, %offset;
+  ld.global.nc.f32 %inp_i, [%inp_i_addr];
+
+  mul.f32 %tmp1, %inp_i, %inp_i;
+  mul.f32 %tmp2, %inp_i, %tmp1;
+  fma.rn.f32 %tmp3, %tmp2, 0F3d372713, %inp_i;
+
+  mul.f32 %tmp4, 0F3f4c4229, %tmp3; 
+  tanh.approx.f32 %tmp5, %tmp4;
+  add.f32 %tmp6, %tmp5, 0F3F800000;
+  mul.f32 %tmp7, %tmp6, %inp_i;
+  mul.f32 %out_i, %tmp7, 0F3F000000;
+
+  add.s64 %out_i_addr, %out_glbl, %offset;
+  st.global.f32 [%out_i_addr], %out_i;
+
+  $exit:
+    ret;
+
+}

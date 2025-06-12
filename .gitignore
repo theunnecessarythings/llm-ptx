@@ -1,0 +1,5 @@
+data/
+infer_gpt2
+infer_gpt2_ptx
+*.bin
+

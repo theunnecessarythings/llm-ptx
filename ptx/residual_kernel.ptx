@@ -1,0 +1,46 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+.visible .entry residual_fwd_kernel(
+	.param .u64 out_param,
+	.param .u64 inp1_param,
+	.param .u64 inp2_param,
+	.param .u32 N_param
+)
+{
+	.reg .pred 	%guard;
+	.reg .b64  %out_addr, %inp1_addr, %inp2_addr, %inp1_glbl, %inp2_glbl, %out_glbl, %offset;
+	.reg .b32  %N, %tid_x, %blockid_x, %blockdim_x, %idx;
+	.reg .f32  %inp1_i, %inp2_i, %out_i;
+	.reg .b64  %inp1_i_addr, %inp2_i_addr, %out_i_addr;
+
+
+	ld.param.u64 	%out_addr, [out_param];
+	ld.param.u64 	%inp1_addr, [inp1_param];
+	ld.param.u64 	%inp2_addr, [inp2_param];
+	ld.param.u32 	%N, [N_param];
+	mov.u32 	%blockid_x, %ctaid.x;
+	mov.u32 	%blockdim_x, %ntid.x;
+	mov.u32 	%tid_x, %tid.x;
+	mad.lo.s32 	%idx, %blockid_x, %blockdim_x, %tid_x;
+	setp.ge.s32 	%guard, %idx, %N;
+	@%guard bra 	$exit;
+
+	cvta.to.global.u64 	%inp1_glbl, %inp1_addr;
+	mul.wide.s32 	%offset, %idx, 4; 
+	add.s64 	%inp1_i_addr, %inp1_glbl, %offset;
+	cvta.to.global.u64 	%inp2_glbl, %inp2_addr;
+	add.s64 	%inp2_i_addr, %inp2_glbl, %offset;
+	ld.global.nc.f32 	%inp1_i, [%inp1_i_addr];
+	ld.global.nc.f32 	%inp2_i, [%inp2_i_addr];
+	add.f32 	%out_i, %inp1_i, %inp2_i;
+	cvta.to.global.u64 	%out_glbl, %out_addr;
+	add.s64 	%out_i_addr, %out_glbl, %offset;
+	st.global.f32 	[%out_i_addr], %out_i;
+
+$exit:
+	ret;
+
+}
+

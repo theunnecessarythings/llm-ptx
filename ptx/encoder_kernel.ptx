@@ -1,0 +1,72 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+.visible .entry encoder_fwd_kernel(
+    .param .u64 p_out,
+    .param .u64 p_inp,
+    .param .u64 p_wte,
+    .param .u64 p_wpe,
+    .param .u32 p_B,
+    .param .u32 p_T,
+    .param .u32 p_C
+)
+{
+    // --- Register Declarations ---
+    .reg .pred  %p_guard;
+    .reg .u32   %r_T, %r_C, %r_b, %r_t, %r_cvec, %r_flat_idx, %r_token_id;
+    .reg .u32   %r_c_start_elems, %r_wte_offset_elems, %r_wpe_offset_elems, %r_out_offset_elems;
+    .reg .u64   %rd_addr, %ptr_out, %ptr_inp, %ptr_wte, %ptr_wpe;
+    .reg .f32   %f_wte<4>, %f_wpe<4>, %f_out<4>;
+
+    // --- 1. Load Parameters & Convert Addresses ---
+    ld.param.u64 %ptr_out, [p_out];
+    ld.param.u64 %ptr_inp, [p_inp];
+    ld.param.u64 %ptr_wte, [p_wte];
+    ld.param.u64 %ptr_wpe, [p_wpe];
+    ld.param.u32 %r_T, [p_T];
+    ld.param.u32 %r_C, [p_C];
+    
+    cvta.to.global.u64 %ptr_out, %ptr_out;
+    cvta.to.global.u64 %ptr_inp, %ptr_inp;
+    cvta.to.global.u64 %ptr_wte, %ptr_wte;
+    cvta.to.global.u64 %ptr_wpe, %ptr_wpe;
+
+    // --- 2. Indexing and Guard Calculation ---
+    mov.u32 %r_b, %ctaid.y;
+    mov.u32 %r_t, %ctaid.x;
+    mov.u32 %r_cvec, %tid.x;
+    
+    shl.b32 %r_c_start_elems, %r_cvec, 2; 
+    setp.lt.u32 %p_guard, %r_c_start_elems, %r_C;
+    @!%p_guard bra EXIT;
+
+    // 3a. Get the token ID
+    mad.lo.u32 %r_flat_idx, %r_b, %r_T, %r_t; 
+    mad.wide.u32 %rd_addr, %r_flat_idx, 4, %ptr_inp;
+    ld.global.u32 %r_token_id, [%rd_addr];
+
+    // 3c. Load WPE vector using MAD
+    mad.lo.u32 %r_wpe_offset_elems, %r_t, %r_C, %r_c_start_elems;
+    mad.wide.u32 %rd_addr, %r_wpe_offset_elems, 4, %ptr_wpe;
+    ld.global.nc.v4.f32 {%f_wpe0, %f_wpe1, %f_wpe2, %f_wpe3}, [%rd_addr];
+
+    // 3b. Load WTE vector using MAD for efficient addressing
+    mad.lo.u32 %r_wte_offset_elems, %r_token_id, %r_C, %r_c_start_elems;
+    mad.wide.u32 %rd_addr, %r_wte_offset_elems, 4, %ptr_wte;
+    ld.global.nc.v4.f32 {%f_wte0, %f_wte1, %f_wte2, %f_wte3}, [%rd_addr];
+
+    // 3d. Computation
+    add.f32 %f_out0, %f_wte0, %f_wpe0;
+    add.f32 %f_out1, %f_wte1, %f_wpe1;
+    add.f32 %f_out2, %f_wte2, %f_wpe2;
+    add.f32 %f_out3, %f_wte3, %f_wpe3;
+
+    // 3e. Store Result using MAD
+    mad.lo.u32 %r_out_offset_elems, %r_flat_idx, %r_C, %r_c_start_elems;
+    mad.wide.u32 %rd_addr, %r_out_offset_elems, 4, %ptr_out;
+    st.global.v4.f32 [%rd_addr], {%f_out0, %f_out1, %f_out2, %f_out3};
+
+EXIT:
+    ret;
+}

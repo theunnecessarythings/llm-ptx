@@ -1,0 +1,588 @@
+.version 8.7
+.target sm_80
+.address_size 64
+
+.visible .entry matmul_fwd_kernel(
+  .param .u64 out_param,
+  .param .u64 inp_param,
+  .param .u64 weight_param,
+  .param .u64 bias_param,
+  .param .u32 C_param,
+  .param .u32 OC_param
+) 
+.maxntid 256, 1, 1
+{
+  // Register Declarations
+  .reg .pred %cond;
+  .reg .f32 %vals<65>, %lhs_<5>, %rhs_s7_<9>, %rhs_s6_<9>, %rhs_s5_<9>, %rhs_s4_<9>,
+            %rhs_s3_<9>, %rhs_s2_<9>, %rhs_s1_<9>, %rhs_s0_<9>, %rhs_s<5>, %lhs_s<5>;
+  .reg .b32 %bidx_x, %bidx_y, %tid_x, %tid_y, %bdim_y, %C, %OC, %oc,
+            %bidx_x_128, %bidx_y_128, %bidx_x_C_128, %bidx_x_OC_128, %weight_offset,
+            %inp_offset, %out_offset, %si_start, %si, %so, %offset,
+            %xmod8, %xby8, %xo, %y, %ii_offset, %u_offset, %si_mod_32,
+            %tidy_8, %out_offset_x;
+  .reg .b64 %out_ptr, %inp_ptr, %weight_ptr, %bias_ptr, %b_ptr, %inp_ptr_i, %weight_ptr_i,
+            %lhs_s_ptr, %rhs_s_ptr, %rhs_s_ptr_i, %lhs_s_ptr_i, %lhs_s, %rhs_s,
+            %out_s_ptr, %OC4;
+ 
+  // buffers to cache chunks of input mats
+  .shared .align 4 .b8 lhs_shared[16384];
+  .shared .align 4 .b8 rhs_shared[16384];
+  mov.u64 %lhs_s, lhs_shared;
+  mov.u64 %rhs_s, rhs_shared;
+ 
+  // Load params
+  ld.param.u64 %out_ptr, [out_param];
+  ld.param.u64 %inp_ptr, [inp_param];
+  ld.param.u64 %weight_ptr, [weight_param];
+  ld.param.u64 %bias_ptr, [bias_param];
+  ld.param.u32 %C, [C_param];
+  ld.param.u32 %OC, [OC_param];
+  cvta.to.global.u64 %out_ptr, %out_ptr;
+  cvta.to.global.u64 %inp_ptr, %inp_ptr;
+  cvta.to.global.u64 %weight_ptr, %weight_ptr;
+  cvta.to.global.u64 %bias_ptr, %bias_ptr;
+
+  mov.u32 %bidx_y, %ctaid.y;
+  mov.u32 %bidx_x, %ctaid.x;
+  mov.u32 %tid_y, %tid.y;
+  mov.u32 %tid_x, %tid.x;
+  mov.u32 %bdim_y, %ntid.y;
+
+  mad.lo.u32 %oc, %bidx_y, %bdim_y, %tid_y;
+  mul.lo.u32 %oc, %oc, 8;
+
+  // C++: inp += 128 * blockIdx.x * C;
+  mul.lo.u32 %bidx_x_128, %bidx_x, 128;
+  mad.lo.u32 %inp_offset, %bidx_x_128, %C, 0;
+  mad.wide.u32 %inp_ptr, %inp_offset, 4, %inp_ptr;
+
+  // C++: weight += 128 * blockIdx.y * C;
+  mul.lo.u32 %bidx_y_128, %bidx_y, 128;
+  mad.lo.u32 %weight_offset, %bidx_y_128, %C, 0;
+  mad.wide.u32 %weight_ptr, %weight_offset, 4, %weight_ptr;
+
+  // C++: out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
+  mad.lo.u32 %out_offset_x, %bidx_x_128, %OC, 0;
+  add.u32 %out_offset, %out_offset_x, %bidx_y_128;
+  mad.wide.u32 %out_ptr, %out_offset, 4, %out_ptr;
+
+
+  setp.ne.u64 %cond, %bias_ptr, 0;
+  mov.f32 %vals1, 0f00000000;
+  mov.f32 %vals2, 0f00000000;
+  mov.f32 %vals3, 0f00000000;
+  mov.f32 %vals4, 0f00000000;
+  mov.f32 %vals5, 0f00000000;
+  mov.f32 %vals6, 0f00000000;
+  mov.f32 %vals7, 0f00000000;
+  mov.f32 %vals8, 0f00000000;
+
+  @!%cond bra $after_load_bias;
+  // Load bias values
+  mad.wide.u32 %b_ptr, %oc, 4, %bias_ptr;
+  ld.global.v4.f32 {%vals1, %vals2, %vals3, %vals4}, [%b_ptr];
+  add.u64 %b_ptr, %b_ptr, 16;
+  ld.global.v4.f32 {%vals5, %vals6, %vals7, %vals8}, [%b_ptr];
+  $after_load_bias:
+  mov.f32 %vals9, %vals1;
+  mov.f32 %vals10, %vals2;
+  mov.f32 %vals11, %vals3;
+  mov.f32 %vals12, %vals4;
+  mov.f32 %vals13, %vals5;
+  mov.f32 %vals14, %vals6;
+  mov.f32 %vals15, %vals7;
+  mov.f32 %vals16, %vals8;
+  mov.f32 %vals17, %vals1;
+  mov.f32 %vals18, %vals2;
+  mov.f32 %vals19, %vals3;
+  mov.f32 %vals20, %vals4;
+  mov.f32 %vals21, %vals5;
+  mov.f32 %vals22, %vals6;
+  mov.f32 %vals23, %vals7;
+  mov.f32 %vals24, %vals8;
+  mov.f32 %vals25, %vals1;
+  mov.f32 %vals26, %vals2;
+  mov.f32 %vals27, %vals3;
+  mov.f32 %vals28, %vals4;
+  mov.f32 %vals29, %vals5;
+  mov.f32 %vals30, %vals6;
+  mov.f32 %vals31, %vals7;
+  mov.f32 %vals32, %vals8;
+  mov.f32 %vals33, %vals1;
+  mov.f32 %vals34, %vals2;
+  mov.f32 %vals35, %vals3;
+  mov.f32 %vals36, %vals4;
+  mov.f32 %vals37, %vals5;
+  mov.f32 %vals38, %vals6;
+  mov.f32 %vals39, %vals7;
+  mov.f32 %vals40, %vals8;
+  mov.f32 %vals41, %vals1;
+  mov.f32 %vals42, %vals2;
+  mov.f32 %vals43, %vals3;
+  mov.f32 %vals44, %vals4;
+  mov.f32 %vals45, %vals5;
+  mov.f32 %vals46, %vals6;
+  mov.f32 %vals47, %vals7;
+  mov.f32 %vals48, %vals8;
+  mov.f32 %vals49, %vals1;
+  mov.f32 %vals50, %vals2;
+  mov.f32 %vals51, %vals3;
+  mov.f32 %vals52, %vals4;
+  mov.f32 %vals53, %vals5;
+  mov.f32 %vals54, %vals6;
+  mov.f32 %vals55, %vals7;
+  mov.f32 %vals56, %vals8;
+  mov.f32 %vals57, %vals1;
+  mov.f32 %vals58, %vals2;
+  mov.f32 %vals59, %vals3;
+  mov.f32 %vals60, %vals4;
+  mov.f32 %vals61, %vals5;
+  mov.f32 %vals62, %vals6;
+  mov.f32 %vals63, %vals7;
+  mov.f32 %vals64, %vals8;
+
+  mad.lo.u32 %si_start, 16, %tid_y, %tid_x;
+  mul.lo.u32 %si_start, 4, %si_start;
+
+  mov.u32 %so, 0;
+  bra $loop_check;
+  $loop_body:
+    bar.sync 0;
+    rem.u32 %xmod8, %tid_x, 8;
+    shr.b32 %xby8, %tid_x, 3;
+    mul.lo.u32 %xo, 4, %xmod8;
+    
+    mad.lo.u32 %y, 2, %tid_y, %xby8;
+    bra $store_loop_check;
+    $store_loop_body:
+      mad.lo.u32 %offset, %y, %C, %so;
+      add.u32 %offset, %offset, %xo;
+      mad.wide.u32 %inp_ptr_i, %offset, 4, %inp_ptr;
+      ld.global.v4.f32 {%lhs_s1, %lhs_s2, %lhs_s3, %lhs_s4}, [%inp_ptr_i];
+      mad.wide.u32 %weight_ptr_i, %offset, 4, %weight_ptr;
+      ld.global.v4.f32 {%rhs_s1, %rhs_s2, %rhs_s3, %rhs_s4}, [%weight_ptr_i];
+      mad.lo.u32 %offset, %y, 32, %xo;
+      mad.wide.u32 %lhs_s_ptr, %offset, 4, %lhs_s;
+      mad.wide.u32 %rhs_s_ptr, %offset, 4, %rhs_s;
+      st.shared.v4.f32 [%lhs_s_ptr], {%lhs_s1, %lhs_s2, %lhs_s3, %lhs_s4};
+      st.shared.v4.f32 [%rhs_s_ptr], {%rhs_s1, %rhs_s2, %rhs_s3, %rhs_s4};
+      add.u32 %y, %y, 32;
+    $store_loop_check:
+      setp.lt.u32 %cond, %y, 128;
+      @%cond bra $store_loop_body;
+
+    bar.sync 0;
+
+    mov.u32 %si, %si_start;
+    add.u32 %si_start, %si_start, 32;
+    bra $si_loop_check;
+    $si_loop_body:
+      // float4 rhs[8];
+      // for (int u = 0; u < 8; ++u) {
+      //   rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
+      // }
+      mul.lo.u32 %tidy_8, %tid_y, 8;
+      rem.u32 %si_mod_32, %si, 32;
+
+      mov.u32 %u_offset, %tidy_8; // u = 0
+      mad.lo.u32 %u_offset, %u_offset, 32, %si_mod_32;
+      mad.wide.u32 %rhs_s_ptr, %u_offset, 4, %rhs_s;
+      ld.shared.v4.f32 {%rhs_s0_1, %rhs_s0_2, %rhs_s0_3, %rhs_s0_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 1
+      ld.shared.v4.f32 {%rhs_s1_1, %rhs_s1_2, %rhs_s1_3, %rhs_s1_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 2
+      ld.shared.v4.f32 {%rhs_s2_1, %rhs_s2_2, %rhs_s2_3, %rhs_s2_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 3
+      ld.shared.v4.f32 {%rhs_s3_1, %rhs_s3_2, %rhs_s3_3, %rhs_s3_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 4
+      ld.shared.v4.f32 {%rhs_s4_1, %rhs_s4_2, %rhs_s4_3, %rhs_s4_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 5
+      ld.shared.v4.f32 {%rhs_s5_1, %rhs_s5_2, %rhs_s5_3, %rhs_s5_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 6
+      ld.shared.v4.f32 {%rhs_s6_1, %rhs_s6_2, %rhs_s6_3, %rhs_s6_4}, [%rhs_s_ptr];
+      add.u64 %rhs_s_ptr, %rhs_s_ptr, 32 * 4; // u = 7
+      ld.shared.v4.f32 {%rhs_s7_1, %rhs_s7_2, %rhs_s7_3, %rhs_s7_4}, [%rhs_s_ptr];
+
+
+      // for (int ii = 0; ii < 8; ++ii) {
+      //   float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
+      //   for (int ji = 0; ji < 8; ++ji) {
+      //     vals[ii][ji] += lhs.x * rhs[ji].x;
+      //     vals[ii][ji] += lhs.y * rhs[ji].y;
+      //     vals[ii][ji] += lhs.z * rhs[ji].z;
+      //     vals[ii][ji] += lhs.w * rhs[ji].w;
+      //   }
+      // }
+      mul.lo.u32 %ii_offset, %tid_x, 8;
+      mad.lo.u32 %ii_offset, %ii_offset, 32, %si_mod_32;
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; // ii = 0
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals1, %lhs_1, %rhs_s0_1, %vals1;
+      fma.rn.f32 %vals1, %lhs_2, %rhs_s0_2, %vals1;
+      fma.rn.f32 %vals1, %lhs_3, %rhs_s0_3, %vals1;
+      fma.rn.f32 %vals1, %lhs_4, %rhs_s0_4, %vals1;
+      fma.rn.f32 %vals2, %lhs_1, %rhs_s1_1, %vals2;
+      fma.rn.f32 %vals2, %lhs_2, %rhs_s1_2, %vals2;
+      fma.rn.f32 %vals2, %lhs_3, %rhs_s1_3, %vals2;
+      fma.rn.f32 %vals2, %lhs_4, %rhs_s1_4, %vals2;
+      fma.rn.f32 %vals3, %lhs_1, %rhs_s2_1, %vals3;
+      fma.rn.f32 %vals3, %lhs_2, %rhs_s2_2, %vals3;
+      fma.rn.f32 %vals3, %lhs_3, %rhs_s2_3, %vals3;
+      fma.rn.f32 %vals3, %lhs_4, %rhs_s2_4, %vals3;
+      fma.rn.f32 %vals4, %lhs_1, %rhs_s3_1, %vals4;
+      fma.rn.f32 %vals4, %lhs_2, %rhs_s3_2, %vals4;
+      fma.rn.f32 %vals4, %lhs_3, %rhs_s3_3, %vals4;
+      fma.rn.f32 %vals4, %lhs_4, %rhs_s3_4, %vals4;
+      fma.rn.f32 %vals5, %lhs_1, %rhs_s4_1, %vals5;
+      fma.rn.f32 %vals5, %lhs_2, %rhs_s4_2, %vals5;
+      fma.rn.f32 %vals5, %lhs_3, %rhs_s4_3, %vals5;
+      fma.rn.f32 %vals5, %lhs_4, %rhs_s4_4, %vals5;
+      fma.rn.f32 %vals6, %lhs_1, %rhs_s5_1, %vals6;
+      fma.rn.f32 %vals6, %lhs_2, %rhs_s5_2, %vals6;
+      fma.rn.f32 %vals6, %lhs_3, %rhs_s5_3, %vals6;
+      fma.rn.f32 %vals6, %lhs_4, %rhs_s5_4, %vals6;
+      fma.rn.f32 %vals7, %lhs_1, %rhs_s6_1, %vals7;
+      fma.rn.f32 %vals7, %lhs_2, %rhs_s6_2, %vals7;
+      fma.rn.f32 %vals7, %lhs_3, %rhs_s6_3, %vals7;
+      fma.rn.f32 %vals7, %lhs_4, %rhs_s6_4, %vals7;
+      fma.rn.f32 %vals8, %lhs_1, %rhs_s7_1, %vals8;
+      fma.rn.f32 %vals8, %lhs_2, %rhs_s7_2, %vals8;
+      fma.rn.f32 %vals8, %lhs_3, %rhs_s7_3, %vals8;
+      fma.rn.f32 %vals8, %lhs_4, %rhs_s7_4, %vals8;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 1
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals9, %lhs_1, %rhs_s0_1, %vals9;
+      fma.rn.f32 %vals9, %lhs_2, %rhs_s0_2, %vals9;
+      fma.rn.f32 %vals9, %lhs_3, %rhs_s0_3, %vals9;
+      fma.rn.f32 %vals9, %lhs_4, %rhs_s0_4, %vals9;
+      fma.rn.f32 %vals10, %lhs_1, %rhs_s1_1, %vals10;
+      fma.rn.f32 %vals10, %lhs_2, %rhs_s1_2, %vals10;
+      fma.rn.f32 %vals10, %lhs_3, %rhs_s1_3, %vals10;
+      fma.rn.f32 %vals10, %lhs_4, %rhs_s1_4, %vals10;
+      fma.rn.f32 %vals11, %lhs_1, %rhs_s2_1, %vals11;
+      fma.rn.f32 %vals11, %lhs_2, %rhs_s2_2, %vals11;
+      fma.rn.f32 %vals11, %lhs_3, %rhs_s2_3, %vals11;
+      fma.rn.f32 %vals11, %lhs_4, %rhs_s2_4, %vals11;
+      fma.rn.f32 %vals12, %lhs_1, %rhs_s3_1, %vals12;
+      fma.rn.f32 %vals12, %lhs_2, %rhs_s3_2, %vals12;
+      fma.rn.f32 %vals12, %lhs_3, %rhs_s3_3, %vals12;
+      fma.rn.f32 %vals12, %lhs_4, %rhs_s3_4, %vals12;
+      fma.rn.f32 %vals13, %lhs_1, %rhs_s4_1, %vals13;
+      fma.rn.f32 %vals13, %lhs_2, %rhs_s4_2, %vals13;
+      fma.rn.f32 %vals13, %lhs_3, %rhs_s4_3, %vals13;
+      fma.rn.f32 %vals13, %lhs_4, %rhs_s4_4, %vals13;
+      fma.rn.f32 %vals14, %lhs_1, %rhs_s5_1, %vals14;
+      fma.rn.f32 %vals14, %lhs_2, %rhs_s5_2, %vals14;
+      fma.rn.f32 %vals14, %lhs_3, %rhs_s5_3, %vals14;
+      fma.rn.f32 %vals14, %lhs_4, %rhs_s5_4, %vals14;
+      fma.rn.f32 %vals15, %lhs_1, %rhs_s6_1, %vals15;
+      fma.rn.f32 %vals15, %lhs_2, %rhs_s6_2, %vals15;
+      fma.rn.f32 %vals15, %lhs_3, %rhs_s6_3, %vals15;
+      fma.rn.f32 %vals15, %lhs_4, %rhs_s6_4, %vals15;
+      fma.rn.f32 %vals16, %lhs_1, %rhs_s7_1, %vals16;
+      fma.rn.f32 %vals16, %lhs_2, %rhs_s7_2, %vals16;
+      fma.rn.f32 %vals16, %lhs_3, %rhs_s7_3, %vals16;
+      fma.rn.f32 %vals16, %lhs_4, %rhs_s7_4, %vals16;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 2
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals17, %lhs_1, %rhs_s0_1, %vals17;
+      fma.rn.f32 %vals17, %lhs_2, %rhs_s0_2, %vals17;
+      fma.rn.f32 %vals17, %lhs_3, %rhs_s0_3, %vals17;
+      fma.rn.f32 %vals17, %lhs_4, %rhs_s0_4, %vals17;
+      fma.rn.f32 %vals18, %lhs_1, %rhs_s1_1, %vals18;
+      fma.rn.f32 %vals18, %lhs_2, %rhs_s1_2, %vals18;
+      fma.rn.f32 %vals18, %lhs_3, %rhs_s1_3, %vals18;
+      fma.rn.f32 %vals18, %lhs_4, %rhs_s1_4, %vals18;
+      fma.rn.f32 %vals19, %lhs_1, %rhs_s2_1, %vals19;
+      fma.rn.f32 %vals19, %lhs_2, %rhs_s2_2, %vals19;
+      fma.rn.f32 %vals19, %lhs_3, %rhs_s2_3, %vals19;
+      fma.rn.f32 %vals19, %lhs_4, %rhs_s2_4, %vals19;
+      fma.rn.f32 %vals20, %lhs_1, %rhs_s3_1, %vals20;
+      fma.rn.f32 %vals20, %lhs_2, %rhs_s3_2, %vals20;
+      fma.rn.f32 %vals20, %lhs_3, %rhs_s3_3, %vals20;
+      fma.rn.f32 %vals20, %lhs_4, %rhs_s3_4, %vals20;
+      fma.rn.f32 %vals21, %lhs_1, %rhs_s4_1, %vals21;
+      fma.rn.f32 %vals21, %lhs_2, %rhs_s4_2, %vals21;
+      fma.rn.f32 %vals21, %lhs_3, %rhs_s4_3, %vals21;
+      fma.rn.f32 %vals21, %lhs_4, %rhs_s4_4, %vals21;
+      fma.rn.f32 %vals22, %lhs_1, %rhs_s5_1, %vals22;
+      fma.rn.f32 %vals22, %lhs_2, %rhs_s5_2, %vals22;
+      fma.rn.f32 %vals22, %lhs_3, %rhs_s5_3, %vals22;
+      fma.rn.f32 %vals22, %lhs_4, %rhs_s5_4, %vals22;
+      fma.rn.f32 %vals23, %lhs_1, %rhs_s6_1, %vals23;
+      fma.rn.f32 %vals23, %lhs_2, %rhs_s6_2, %vals23;
+      fma.rn.f32 %vals23, %lhs_3, %rhs_s6_3, %vals23;
+      fma.rn.f32 %vals23, %lhs_4, %rhs_s6_4, %vals23;
+      fma.rn.f32 %vals24, %lhs_1, %rhs_s7_1, %vals24;
+      fma.rn.f32 %vals24, %lhs_2, %rhs_s7_2, %vals24;
+      fma.rn.f32 %vals24, %lhs_3, %rhs_s7_3, %vals24;
+      fma.rn.f32 %vals24, %lhs_4, %rhs_s7_4, %vals24;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 3
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals25, %lhs_1, %rhs_s0_1, %vals25;
+      fma.rn.f32 %vals25, %lhs_2, %rhs_s0_2, %vals25;
+      fma.rn.f32 %vals25, %lhs_3, %rhs_s0_3, %vals25;
+      fma.rn.f32 %vals25, %lhs_4, %rhs_s0_4, %vals25;
+      fma.rn.f32 %vals26, %lhs_1, %rhs_s1_1, %vals26;
+      fma.rn.f32 %vals26, %lhs_2, %rhs_s1_2, %vals26;
+      fma.rn.f32 %vals26, %lhs_3, %rhs_s1_3, %vals26;
+      fma.rn.f32 %vals26, %lhs_4, %rhs_s1_4, %vals26;
+      fma.rn.f32 %vals27, %lhs_1, %rhs_s2_1, %vals27;
+      fma.rn.f32 %vals27, %lhs_2, %rhs_s2_2, %vals27;
+      fma.rn.f32 %vals27, %lhs_3, %rhs_s2_3, %vals27;
+      fma.rn.f32 %vals27, %lhs_4, %rhs_s2_4, %vals27;
+      fma.rn.f32 %vals28, %lhs_1, %rhs_s3_1, %vals28;
+      fma.rn.f32 %vals28, %lhs_2, %rhs_s3_2, %vals28;
+      fma.rn.f32 %vals28, %lhs_3, %rhs_s3_3, %vals28;
+      fma.rn.f32 %vals28, %lhs_4, %rhs_s3_4, %vals28;
+      fma.rn.f32 %vals29, %lhs_1, %rhs_s4_1, %vals29;
+      fma.rn.f32 %vals29, %lhs_2, %rhs_s4_2, %vals29;
+      fma.rn.f32 %vals29, %lhs_3, %rhs_s4_3, %vals29;
+      fma.rn.f32 %vals29, %lhs_4, %rhs_s4_4, %vals29;
+      fma.rn.f32 %vals30, %lhs_1, %rhs_s5_1, %vals30;
+      fma.rn.f32 %vals30, %lhs_2, %rhs_s5_2, %vals30;
+      fma.rn.f32 %vals30, %lhs_3, %rhs_s5_3, %vals30;
+      fma.rn.f32 %vals30, %lhs_4, %rhs_s5_4, %vals30;
+      fma.rn.f32 %vals31, %lhs_1, %rhs_s6_1, %vals31;
+      fma.rn.f32 %vals31, %lhs_2, %rhs_s6_2, %vals31;
+      fma.rn.f32 %vals31, %lhs_3, %rhs_s6_3, %vals31;
+      fma.rn.f32 %vals31, %lhs_4, %rhs_s6_4, %vals31;
+      fma.rn.f32 %vals32, %lhs_1, %rhs_s7_1, %vals32;
+      fma.rn.f32 %vals32, %lhs_2, %rhs_s7_2, %vals32;
+      fma.rn.f32 %vals32, %lhs_3, %rhs_s7_3, %vals32;
+      fma.rn.f32 %vals32, %lhs_4, %rhs_s7_4, %vals32;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 4
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals33, %lhs_1, %rhs_s0_1, %vals33;
+      fma.rn.f32 %vals33, %lhs_2, %rhs_s0_2, %vals33;
+      fma.rn.f32 %vals33, %lhs_3, %rhs_s0_3, %vals33;
+      fma.rn.f32 %vals33, %lhs_4, %rhs_s0_4, %vals33;
+      fma.rn.f32 %vals34, %lhs_1, %rhs_s1_1, %vals34;
+      fma.rn.f32 %vals34, %lhs_2, %rhs_s1_2, %vals34;
+      fma.rn.f32 %vals34, %lhs_3, %rhs_s1_3, %vals34;
+      fma.rn.f32 %vals34, %lhs_4, %rhs_s1_4, %vals34;
+      fma.rn.f32 %vals35, %lhs_1, %rhs_s2_1, %vals35;
+      fma.rn.f32 %vals35, %lhs_2, %rhs_s2_2, %vals35;
+      fma.rn.f32 %vals35, %lhs_3, %rhs_s2_3, %vals35;
+      fma.rn.f32 %vals35, %lhs_4, %rhs_s2_4, %vals35;
+      fma.rn.f32 %vals36, %lhs_1, %rhs_s3_1, %vals36;
+      fma.rn.f32 %vals36, %lhs_2, %rhs_s3_2, %vals36;
+      fma.rn.f32 %vals36, %lhs_3, %rhs_s3_3, %vals36;
+      fma.rn.f32 %vals36, %lhs_4, %rhs_s3_4, %vals36;
+      fma.rn.f32 %vals37, %lhs_1, %rhs_s4_1, %vals37;
+      fma.rn.f32 %vals37, %lhs_2, %rhs_s4_2, %vals37;
+      fma.rn.f32 %vals37, %lhs_3, %rhs_s4_3, %vals37;
+      fma.rn.f32 %vals37, %lhs_4, %rhs_s4_4, %vals37;
+      fma.rn.f32 %vals38, %lhs_1, %rhs_s5_1, %vals38;
+      fma.rn.f32 %vals38, %lhs_2, %rhs_s5_2, %vals38;
+      fma.rn.f32 %vals38, %lhs_3, %rhs_s5_3, %vals38;
+      fma.rn.f32 %vals38, %lhs_4, %rhs_s5_4, %vals38;
+      fma.rn.f32 %vals39, %lhs_1, %rhs_s6_1, %vals39;
+      fma.rn.f32 %vals39, %lhs_2, %rhs_s6_2, %vals39;
+      fma.rn.f32 %vals39, %lhs_3, %rhs_s6_3, %vals39;
+      fma.rn.f32 %vals39, %lhs_4, %rhs_s6_4, %vals39;
+      fma.rn.f32 %vals40, %lhs_1, %rhs_s7_1, %vals40;
+      fma.rn.f32 %vals40, %lhs_2, %rhs_s7_2, %vals40;
+      fma.rn.f32 %vals40, %lhs_3, %rhs_s7_3, %vals40;
+      fma.rn.f32 %vals40, %lhs_4, %rhs_s7_4, %vals40;
+ 
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 5
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals41, %lhs_1, %rhs_s0_1, %vals41;
+      fma.rn.f32 %vals41, %lhs_2, %rhs_s0_2, %vals41;
+      fma.rn.f32 %vals41, %lhs_3, %rhs_s0_3, %vals41;
+      fma.rn.f32 %vals41, %lhs_4, %rhs_s0_4, %vals41;
+      fma.rn.f32 %vals42, %lhs_1, %rhs_s1_1, %vals42;
+      fma.rn.f32 %vals42, %lhs_2, %rhs_s1_2, %vals42;
+      fma.rn.f32 %vals42, %lhs_3, %rhs_s1_3, %vals42;
+      fma.rn.f32 %vals42, %lhs_4, %rhs_s1_4, %vals42;
+      fma.rn.f32 %vals43, %lhs_1, %rhs_s2_1, %vals43;
+      fma.rn.f32 %vals43, %lhs_2, %rhs_s2_2, %vals43;
+      fma.rn.f32 %vals43, %lhs_3, %rhs_s2_3, %vals43;
+      fma.rn.f32 %vals43, %lhs_4, %rhs_s2_4, %vals43;
+      fma.rn.f32 %vals44, %lhs_1, %rhs_s3_1, %vals44;
+      fma.rn.f32 %vals44, %lhs_2, %rhs_s3_2, %vals44;
+      fma.rn.f32 %vals44, %lhs_3, %rhs_s3_3, %vals44;
+      fma.rn.f32 %vals44, %lhs_4, %rhs_s3_4, %vals44;
+      fma.rn.f32 %vals45, %lhs_1, %rhs_s4_1, %vals45;
+      fma.rn.f32 %vals45, %lhs_2, %rhs_s4_2, %vals45;
+      fma.rn.f32 %vals45, %lhs_3, %rhs_s4_3, %vals45;
+      fma.rn.f32 %vals45, %lhs_4, %rhs_s4_4, %vals45;
+      fma.rn.f32 %vals46, %lhs_1, %rhs_s5_1, %vals46;
+      fma.rn.f32 %vals46, %lhs_2, %rhs_s5_2, %vals46;
+      fma.rn.f32 %vals46, %lhs_3, %rhs_s5_3, %vals46;
+      fma.rn.f32 %vals46, %lhs_4, %rhs_s5_4, %vals46;
+      fma.rn.f32 %vals47, %lhs_1, %rhs_s6_1, %vals47;
+      fma.rn.f32 %vals47, %lhs_2, %rhs_s6_2, %vals47;
+      fma.rn.f32 %vals47, %lhs_3, %rhs_s6_3, %vals47;
+      fma.rn.f32 %vals47, %lhs_4, %rhs_s6_4, %vals47;
+      fma.rn.f32 %vals48, %lhs_1, %rhs_s7_1, %vals48;
+      fma.rn.f32 %vals48, %lhs_2, %rhs_s7_2, %vals48;
+      fma.rn.f32 %vals48, %lhs_3, %rhs_s7_3, %vals48;
+      fma.rn.f32 %vals48, %lhs_4, %rhs_s7_4, %vals48;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 6
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals49, %lhs_1, %rhs_s0_1, %vals49;
+      fma.rn.f32 %vals49, %lhs_2, %rhs_s0_2, %vals49;
+      fma.rn.f32 %vals49, %lhs_3, %rhs_s0_3, %vals49;
+      fma.rn.f32 %vals49, %lhs_4, %rhs_s0_4, %vals49;
+      fma.rn.f32 %vals50, %lhs_1, %rhs_s1_1, %vals50;
+      fma.rn.f32 %vals50, %lhs_2, %rhs_s1_2, %vals50;
+      fma.rn.f32 %vals50, %lhs_3, %rhs_s1_3, %vals50;
+      fma.rn.f32 %vals50, %lhs_4, %rhs_s1_4, %vals50;
+      fma.rn.f32 %vals51, %lhs_1, %rhs_s2_1, %vals51;
+      fma.rn.f32 %vals51, %lhs_2, %rhs_s2_2, %vals51;
+      fma.rn.f32 %vals51, %lhs_3, %rhs_s2_3, %vals51;
+      fma.rn.f32 %vals51, %lhs_4, %rhs_s2_4, %vals51;
+      fma.rn.f32 %vals52, %lhs_1, %rhs_s3_1, %vals52;
+      fma.rn.f32 %vals52, %lhs_2, %rhs_s3_2, %vals52;
+      fma.rn.f32 %vals52, %lhs_3, %rhs_s3_3, %vals52;
+      fma.rn.f32 %vals52, %lhs_4, %rhs_s3_4, %vals52;
+      fma.rn.f32 %vals53, %lhs_1, %rhs_s4_1, %vals53;
+      fma.rn.f32 %vals53, %lhs_2, %rhs_s4_2, %vals53;
+      fma.rn.f32 %vals53, %lhs_3, %rhs_s4_3, %vals53;
+      fma.rn.f32 %vals53, %lhs_4, %rhs_s4_4, %vals53;
+      fma.rn.f32 %vals54, %lhs_1, %rhs_s5_1, %vals54;
+      fma.rn.f32 %vals54, %lhs_2, %rhs_s5_2, %vals54;
+      fma.rn.f32 %vals54, %lhs_3, %rhs_s5_3, %vals54;
+      fma.rn.f32 %vals54, %lhs_4, %rhs_s5_4, %vals54;
+      fma.rn.f32 %vals55, %lhs_1, %rhs_s6_1, %vals55;
+      fma.rn.f32 %vals55, %lhs_2, %rhs_s6_2, %vals55;
+      fma.rn.f32 %vals55, %lhs_3, %rhs_s6_3, %vals55;
+      fma.rn.f32 %vals55, %lhs_4, %rhs_s6_4, %vals55;
+      fma.rn.f32 %vals56, %lhs_1, %rhs_s7_1, %vals56;
+      fma.rn.f32 %vals56, %lhs_2, %rhs_s7_2, %vals56;
+      fma.rn.f32 %vals56, %lhs_3, %rhs_s7_3, %vals56;
+      fma.rn.f32 %vals56, %lhs_4, %rhs_s7_4, %vals56;
+
+      add.u32 %ii_offset, %ii_offset, 32; // ii = 7
+      mad.wide.u32 %lhs_s_ptr, %ii_offset, 4, %lhs_s; 
+      ld.shared.v4.f32 {%lhs_1, %lhs_2, %lhs_3, %lhs_4}, [%lhs_s_ptr];
+      fma.rn.f32 %vals57, %lhs_1, %rhs_s0_1, %vals57;
+      fma.rn.f32 %vals57, %lhs_2, %rhs_s0_2, %vals57;
+      fma.rn.f32 %vals57, %lhs_3, %rhs_s0_3, %vals57;
+      fma.rn.f32 %vals57, %lhs_4, %rhs_s0_4, %vals57;
+      fma.rn.f32 %vals58, %lhs_1, %rhs_s1_1, %vals58;
+      fma.rn.f32 %vals58, %lhs_2, %rhs_s1_2, %vals58;
+      fma.rn.f32 %vals58, %lhs_3, %rhs_s1_3, %vals58;
+      fma.rn.f32 %vals58, %lhs_4, %rhs_s1_4, %vals58;
+      fma.rn.f32 %vals59, %lhs_1, %rhs_s2_1, %vals59;
+      fma.rn.f32 %vals59, %lhs_2, %rhs_s2_2, %vals59;
+      fma.rn.f32 %vals59, %lhs_3, %rhs_s2_3, %vals59;
+      fma.rn.f32 %vals59, %lhs_4, %rhs_s2_4, %vals59;
+      fma.rn.f32 %vals60, %lhs_1, %rhs_s3_1, %vals60;
+      fma.rn.f32 %vals60, %lhs_2, %rhs_s3_2, %vals60;
+      fma.rn.f32 %vals60, %lhs_3, %rhs_s3_3, %vals60;
+      fma.rn.f32 %vals60, %lhs_4, %rhs_s3_4, %vals60;
+      fma.rn.f32 %vals61, %lhs_1, %rhs_s4_1, %vals61;
+      fma.rn.f32 %vals61, %lhs_2, %rhs_s4_2, %vals61;
+      fma.rn.f32 %vals61, %lhs_3, %rhs_s4_3, %vals61;
+      fma.rn.f32 %vals61, %lhs_4, %rhs_s4_4, %vals61;
+      fma.rn.f32 %vals62, %lhs_1, %rhs_s5_1, %vals62;
+      fma.rn.f32 %vals62, %lhs_2, %rhs_s5_2, %vals62;
+      fma.rn.f32 %vals62, %lhs_3, %rhs_s5_3, %vals62;
+      fma.rn.f32 %vals62, %lhs_4, %rhs_s5_4, %vals62;
+      fma.rn.f32 %vals63, %lhs_1, %rhs_s6_1, %vals63;
+      fma.rn.f32 %vals63, %lhs_2, %rhs_s6_2, %vals63;
+      fma.rn.f32 %vals63, %lhs_3, %rhs_s6_3, %vals63;
+      fma.rn.f32 %vals63, %lhs_4, %rhs_s6_4, %vals63;
+      fma.rn.f32 %vals64, %lhs_1, %rhs_s7_1, %vals64;
+      fma.rn.f32 %vals64, %lhs_2, %rhs_s7_2, %vals64;
+      fma.rn.f32 %vals64, %lhs_3, %rhs_s7_3, %vals64;
+      fma.rn.f32 %vals64, %lhs_4, %rhs_s7_4, %vals64;
+      
+      add.u32 %si, %si, 4; // si += 4
+    $si_loop_check:
+      setp.lt.u32 %cond, %si, %si_start;
+      @%cond bra $si_loop_body;
+
+    add.u32 %so, %so, 32; // so += 32
+  $loop_check:
+    setp.lt.u32 %cond, %so, %C;
+    @%cond bra $loop_body;
+
+  // for (int i = 0; i < 8; ++i) {
+  //   for (int j = 0; j < 8; j += 4) {
+  //     float4 result;
+  //     result.x = vals[i][j + 0];
+  //     result.y = vals[i][j + 1];
+  //     result.z = vals[i][j + 2];
+  //     result.w = vals[i][j + 3];
+  //     st_vec(out + (8 * threadIdx.x + i) * OC + 8 * threadIdx.y + j, result);
+  //   }
+  // }
+
+  // Calculate the base output pointer for this thread's 8x8 tile
+  // Base element offset = (8 * tid_x) * OC + (8 * tid_y)
+  mul.lo.u32 %offset, %tid_x, 8;
+  mad.lo.u32 %offset, %offset, %OC, 0; // (8 * tid_x) * OC
+  mul.lo.u32 %tidy_8, %tid_y, 8;
+  add.u32 %offset, %offset, %tidy_8; // (8 * tid_x) * OC + (8 * tid_y)
+  mad.wide.u32 %out_s_ptr, %offset, 4, %out_ptr; // Starting byte address for vals[0][0]
+
+  // Get the row stride in bytes
+  mul.wide.u32 %OC4, %OC, 4;
+
+  // i = 0
+  st.global.v4.f32 [%out_s_ptr], {%vals1, %vals2, %vals3, %vals4};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals5, %vals6, %vals7, %vals8};
+
+  // i = 1: Advance base pointer by one row
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals9, %vals10, %vals11, %vals12};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals13, %vals14, %vals15, %vals16};
+
+  // i = 2: Advance base pointer by one row
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals17, %vals18, %vals19, %vals20};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals21, %vals22, %vals23, %vals24};
+
+  // ... and so on for i = 3 to 7, always adding %OC4 to %out_s_ptr ...
+
+  // i = 3
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals25, %vals26, %vals27, %vals28};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals29, %vals30, %vals31, %vals32};
+
+  // i = 4
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals33, %vals34, %vals35, %vals36};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals37, %vals38, %vals39, %vals40};
+
+  // i = 5
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals41, %vals42, %vals43, %vals44};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals45, %vals46, %vals47, %vals48};
+
+  // i = 6
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals49, %vals50, %vals51, %vals52};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals53, %vals54, %vals55, %vals56};
+
+  // i = 7
+  add.u64 %out_s_ptr, %out_s_ptr, %OC4;
+  st.global.v4.f32 [%out_s_ptr], {%vals57, %vals58, %vals59, %vals60};
+  add.u64 %b_ptr, %out_s_ptr, 16;
+  st.global.v4.f32 [%b_ptr], {%vals61, %vals62, %vals63, %vals64};
+
+  ret;
+}
