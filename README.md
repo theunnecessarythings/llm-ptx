@@ -11,13 +11,15 @@
 ### PTX Version
 
 ```bash
-nvcc --use_fast_math -std=c++17 -O3 infer_gpt2_ptx.cu -o infer_gpt2_ptx -lcuda -arch=sm_80
+nvcc --use_fast_math -std=c++17 -O3 main.cu -o main_ptx -lcuda -arch=sm_80 -DPTX
+./main_ptx
 ```
 
 ### CUDA Version
 
 ```bash
-nvcc --use_fast_math -std=c++17 -O3 infer_gpt2.cu -o infer_gpt2 -lcuda -arch=sm_80
+nvcc --use_fast_math -std=c++17 -O3 main.cu -o main_cuda -lcuda -arch=sm_80
+./main_cuda
 ```
 
 ## Performance

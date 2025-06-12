@@ -2,4 +2,7 @@ data/
 infer_gpt2
 infer_gpt2_ptx
 *.bin
+main
+main_ptx
+main_cuda
 
