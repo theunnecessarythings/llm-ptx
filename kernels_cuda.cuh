@@ -91,6 +91,61 @@ __inline__ __device__ float blockReduceSum(float val) {
   return shared[0];
 }
 
+__global__ void
+softmax_fwd_kernel(float *__restrict__ probs,        // [B*T][Vp]
+                   const float *__restrict__ logits, // [B*T][Vp]
+                   int B, int T, int V, int Vp) {
+  int bt = blockIdx.x; // in [0..B*T)
+  int N = B * T;
+  if (bt >= N)
+    return;
+
+  const float *logits_bt = logits + bt * Vp;
+  float *probs_bt = probs + bt * Vp;
+
+  int tid = threadIdx.x;
+  int threads = blockDim.x;
+
+  // 1) find max over real vocab [0..V)
+  float local_max = -CUDART_INF_F;
+  for (int i = tid; i < V; i += threads) {
+    local_max = fmaxf(local_max, logits_bt[i]);
+  }
+  float maxval = blockReduceMax(local_max);
+  __syncthreads();
+
+  // 2) compute exp(logit - maxval) and partial sum
+  float local_sum = 0.0f;
+  for (int i = tid; i < V; i += threads) {
+    float e = expf(logits_bt[i] - maxval);
+    probs_bt[i] = e;
+    local_sum += e;
+  }
+  float sum = blockReduceSum(local_sum);
+  __syncthreads();
+
+  float inv_sum = (sum > 0.0f ? 1.0f / sum : 0.0f);
+
+  // 3) normalize the real-vocab probabilities
+  for (int i = tid; i < V; i += threads) {
+    probs_bt[i] *= inv_sum;
+  }
+  // 4) zero out the padded entries [V..Vp)
+  for (int i = V + tid; i < Vp; i += threads) {
+    probs_bt[i] = 0.0f;
+  }
+}
+
+void softmax_forward(float *probs, const float *logits, int B, int T, int V,
+                     int Vp, cudaStream_t stream = 0) {
+  int N = B * T;
+  int threads = std::min(1024, Vp);
+  int blocks = N;
+  softmax_fwd_kernel<<<blocks, threads, 0, stream>>>(probs, logits, B, T, V,
+                                                     Vp);
+  cudaErrorCheck();
+}
+
 __global__ void encoder_fwd_kernel(float *out, const int *inp, const float *wte,
                                    const float *wpe, int B, int T, int C) {
   int b = blockIdx.y;
@@ -554,60 +609,6 @@ void residual_forward(float *out, const float *inp1, const float *inp2, int N,
   int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
   residual_fwd_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(out, inp1, inp2,
                                                                 N);
-  cudaErrorCheck();
-}
-__global__ void
-softmax_fwd_kernel(float *__restrict__ probs,        // [B*T][Vp]
-                   const float *__restrict__ logits, // [B*T][Vp]
-                   int B, int T, int V, int Vp) {
-  int bt = blockIdx.x; // in [0..B*T)
-  int N = B * T;
-  if (bt >= N)
-    return;
-
-  const float *logits_bt = logits + bt * Vp;
-  float *probs_bt = probs + bt * Vp;
-
-  int tid = threadIdx.x;
-  int threads = blockDim.x;
-
-  // 1) find max over real vocab [0..V)
-  float local_max = -CUDART_INF_F;
-  for (int i = tid; i < V; i += threads) {
-    local_max = fmaxf(local_max, logits_bt[i]);
-  }
-  float maxval = blockReduceMax(local_max);
-  __syncthreads();
-
-  // 2) compute exp(logit - maxval) and partial sum
-  float local_sum = 0.0f;
-  for (int i = tid; i < V; i += threads) {
-    float e = expf(logits_bt[i] - maxval);
-    probs_bt[i] = e;
-    local_sum += e;
-  }
-  float sum = blockReduceSum(local_sum);
-  __syncthreads();
-
-  float inv_sum = (sum > 0.0f ? 1.0f / sum : 0.0f);
-
-  // 3) normalize the real-vocab probabilities
-  for (int i = tid; i < V; i += threads) {
-    probs_bt[i] *= inv_sum;
-  }
-  // 4) zero out the padded entries [V..Vp)
-  for (int i = V + tid; i < Vp; i += threads) {
-    probs_bt[i] = 0.0f;
-  }
-}
-
-void softmax_forward(float *probs, const float *logits, int B, int T, int V,
-                     int Vp, cudaStream_t stream = 0) {
-  int N = B * T;
-  int threads = std::min(1024, Vp);
-  int blocks = N;
-  softmax_fwd_kernel<<<blocks, threads, 0, stream>>>(probs, logits, B, T, V,
-                                                     Vp);
   cudaErrorCheck();
 }
 
